@@ -11,7 +11,69 @@ from os.path import splitext, isfile, join
 from pathlib import Path
 from torch.utils.data import Dataset
 from tqdm import tqdm
+import SimpleITK as sitk
+from torchvision.transforms import functional as TF
+import random
+from scipy.ndimage import gaussian_filter, map_coordinates
+import cv2
 
+def apply_clahe(image_np):
+    """
+    Apply CLAHE to a grayscale image (2D NumPy array).
+    """
+    image_uint8 = np.uint8(np.clip(image_np, 0, 255))  # Ensure 8-bit input
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(4, 4))
+    enhanced = clahe.apply(image_uint8)
+    return enhanced.astype(np.float32)
+
+
+def apply_bias_correction(np_img):
+    sitk_image = sitk.GetImageFromArray(np_img.astype(np.float32))
+    corrector = sitk.N4BiasFieldCorrectionImageFilter()
+    mask_image = sitk.OtsuThreshold(sitk_image, 0, 1, 200)
+    corrected_image = corrector.Execute(sitk_image, mask_image)
+    corrected_np = sitk.GetArrayFromImage(corrected_image)
+    return corrected_np
+
+def elastic_deform_2d(image_np, alpha=34, sigma=4):
+    random_state = np.random.RandomState(None)
+
+    shape = image_np.shape
+    dx = gaussian_filter((random_state.rand(*shape) * 2 - 1), sigma) * alpha
+    dy = gaussian_filter((random_state.rand(*shape) * 2 - 1), sigma) * alpha
+
+    x, y = np.meshgrid(np.arange(shape[1]), np.arange(shape[0]))
+    indices = (y + dy).reshape(-1), (x + dx).reshape(-1)
+
+    return map_coordinates(image_np, indices, order=1, mode='reflect').reshape(shape)
+
+
+def joint_augment(image, mask):
+    # ✅ Convert to NumPy
+    img_np = np.asarray(image).astype(np.float32)
+    mask_np = np.asarray(mask).astype(np.uint8)
+
+    # ✅ 50% chance to apply elastic deformation
+    if random.random() < 0.5:
+        img_np = elastic_deform_2d(img_np, alpha=34, sigma=4)
+        mask_np = elastic_deform_2d(mask_np, alpha=34, sigma=4)
+
+    # ✅ Convert back to PIL
+    image = Image.fromarray(img_np).convert('L')
+    mask = Image.fromarray(mask_np)
+
+    # 🔁 Optional flips & rotations
+    if random.random() > 0.5:
+        image = TF.hflip(image)
+        mask = TF.hflip(mask)
+    if random.random() > 0.5:
+        image = TF.vflip(image)
+        mask = TF.vflip(mask)
+    angle = random.choice([0, 90, 180, 270])
+    image = TF.rotate(image, angle)
+    mask = TF.rotate(mask, angle)
+
+    return image, mask
 
 def load_image(filename):
     ext = splitext(filename)[1]
@@ -68,6 +130,7 @@ class BasicDataset(Dataset):
         assert newW > 0 and newH > 0, 'Scale is too small, resized images would have no pixel'
         pil_img = pil_img.resize((newW, newH), resample=Image.NEAREST if is_mask else Image.BICUBIC)
         img = np.asarray(pil_img)
+        img = apply_clahe(img)
 
         if is_mask:
             mask = np.zeros((newH, newW), dtype=np.int64)
@@ -76,19 +139,30 @@ class BasicDataset(Dataset):
                     mask[img == v] = i
                 else:
                     mask[(img == v).all(-1)] = i
-
             return mask
 
         else:
             if img.ndim == 2:
-                img = img[np.newaxis, ...]
-            else:
-                img = img.transpose((2, 0, 1))
+                # ✅ Step 1: Apply bias correction BEFORE Z-score
+                img = apply_bias_correction(img)
 
-            if (img > 1).any():
-                img = img / 255.0
+                # ✅ Step 2: Convert to shape (1, H, W)
+                img = img[np.newaxis, ...]
+
+                # ✅ Step 3: Apply Brain-Only Z-score normalization
+                brain_mask = img > 0
+                brain_values = img[brain_mask]
+
+                mean = brain_values.mean()
+                std = brain_values.std()
+                if std == 0: std = 1.0
+                img = (img - mean) / std
+
+            else:
+                raise ValueError("Expected grayscale image (2D), got color image.")
 
             return img
+
 
     def __getitem__(self, idx):
         name = self.ids[idx]
@@ -102,6 +176,8 @@ class BasicDataset(Dataset):
 
         assert img.size == mask.size, \
             f'Image and mask {name} should be the same size, but are {img.size} and {mask.size}'
+        
+        img, mask = joint_augment(img, mask)    
 
         img = self.preprocess(self.mask_values, img, self.scale, is_mask=False)
         mask = self.preprocess(self.mask_values, mask, self.scale, is_mask=True)
