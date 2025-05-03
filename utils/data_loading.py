@@ -17,14 +17,33 @@ import random
 from scipy.ndimage import gaussian_filter, map_coordinates
 import cv2
 
+import cv2
+import numpy as np
+
 def apply_clahe(image_np):
     """
     Apply CLAHE to a grayscale image (2D NumPy array).
+    If input is 3D (1, H, W) or (H, W, 1), it squeezes it automatically.
     """
-    image_uint8 = np.uint8(np.clip(image_np, 0, 255))  # Ensure 8-bit input
+    # ✅ Squeeze extra dimensions if any
+    if image_np.ndim == 3:
+        image_np = np.squeeze(image_np)
+
+    # ✅ Confirm image is now 2D
+    if image_np.ndim != 2:
+        raise ValueError(f"Expected 2D grayscale image for CLAHE, got shape {image_np.shape}")
+
+    # ✅ Make sure it is 8-bit
+    image_uint8 = np.uint8(np.clip(image_np, 0, 255))
+
+    # ✅ Create CLAHE object
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(4, 4))
+
+    # ✅ Apply CLAHE
     enhanced = clahe.apply(image_uint8)
+
     return enhanced.astype(np.float32)
+
 
 
 def apply_bias_correction(np_img):
@@ -49,7 +68,6 @@ def elastic_deform_2d(image_np, alpha=34, sigma=4):
 
 
 def joint_augment(image, mask):
-    # ✅ Convert to NumPy
     img_np = np.asarray(image).astype(np.float32)
     mask_np = np.asarray(mask).astype(np.uint8)
 
@@ -57,10 +75,9 @@ def joint_augment(image, mask):
     if random.random() < 0.5:
         img_np = elastic_deform_2d(img_np, alpha=34, sigma=4)
         mask_np = elastic_deform_2d(mask_np, alpha=34, sigma=4)
-
-    # ✅ Convert back to PIL
-    image = Image.fromarray(img_np).convert('L')
-    mask = Image.fromarray(mask_np)
+        
+        image = Image.fromarray(np.uint8(np.clip(img_np, 0, 255)))
+        mask = Image.fromarray(np.uint8(np.clip(mask_np, 0, 255)))
 
     # 🔁 Optional flips & rotations
     if random.random() > 0.5:
@@ -73,16 +90,25 @@ def joint_augment(image, mask):
     image = TF.rotate(image, angle)
     mask = TF.rotate(mask, angle)
 
+    # 🌟 Random brightness and contrast (for image only, not mask)
+    if random.random() < 0.5:
+        brightness_factor = random.uniform(0.9, 1.1)
+        contrast_factor = random.uniform(0.9, 1.1)
+        image = TF.adjust_brightness(image, brightness_factor)
+        image = TF.adjust_contrast(image, contrast_factor)
+
     return image, mask
+
 
 def load_image(filename):
     ext = splitext(filename)[1]
     if ext == '.npy':
-        return Image.fromarray(np.load(filename))
+        return Image.fromarray(np.load(filename)).convert('L')
     elif ext in ['.pt', '.pth']:
-        return Image.fromarray(torch.load(filename).numpy())
+        return Image.fromarray(torch.load(filename).numpy()).convert('L')
     else:
-        return Image.open(filename)
+        return Image.open(filename).convert('L')
+
 
 
 def unique_mask_values(idx, mask_dir, mask_suffix):
@@ -105,26 +131,23 @@ class BasicDataset(Dataset):
         self.scale = scale
         self.mask_suffix = mask_suffix
 
-        self.ids = [splitext(file)[0] for file in listdir(images_dir) if isfile(join(images_dir, file)) and not file.startswith('.')]
+        self.ids = [
+            splitext(file)[0]
+            for file in listdir(images_dir)
+            if isfile(join(images_dir, file)) and file.startswith('volume_1_slice')
+        ]
+
         if not self.ids:
             raise RuntimeError(f'No input file found in {images_dir}, make sure you put your images there')
 
         logging.info(f'Creating dataset with {len(self.ids)} examples')
-        logging.info('Scanning mask files to determine unique values')
-        with Pool() as p:
-            unique = list(tqdm(
-                p.imap(partial(unique_mask_values, mask_dir=self.mask_dir, mask_suffix=self.mask_suffix), self.ids),
-                total=len(self.ids)
-            ))
 
-        self.mask_values = list(sorted(np.unique(np.concatenate(unique), axis=0).tolist()))
-        logging.info(f'Unique mask values: {self.mask_values}')
 
     def __len__(self):
         return len(self.ids)
 
     @staticmethod
-    def preprocess(mask_values, pil_img, scale, is_mask):
+    def preprocess(pil_img, scale, is_mask):
         w, h = pil_img.size
         newW, newH = int(scale * w), int(scale * h)
         assert newW > 0 and newH > 0, 'Scale is too small, resized images would have no pixel'
@@ -133,13 +156,12 @@ class BasicDataset(Dataset):
         img = apply_clahe(img)
 
         if is_mask:
-            mask = np.zeros((newH, newW), dtype=np.int64)
-            for i, v in enumerate(mask_values):
-                if img.ndim == 2:
-                    mask[img == v] = i
-                else:
-                    mask[(img == v).all(-1)] = i
+            if img.ndim == 3:
+                img = img[..., 0]  # Take first channel if accidentally RGB
+            mask = (img > 0).astype(np.float32)  # Binarize
+            mask = mask[np.newaxis, ...]  # Shape: (1, H, W)
             return mask
+
 
         else:
             if img.ndim == 2:
@@ -166,7 +188,7 @@ class BasicDataset(Dataset):
 
     def __getitem__(self, idx):
         name = self.ids[idx]
-        mask_file = list(self.mask_dir.glob(name + self.mask_suffix + '.*'))
+        mask_file = list(self.mask_dir.glob(name + '_mask.*'))
         img_file = list(self.images_dir.glob(name + '.*'))
 
         assert len(img_file) == 1, f'Either no image or multiple images found for the ID {name}: {img_file}'
@@ -179,8 +201,9 @@ class BasicDataset(Dataset):
         
         img, mask = joint_augment(img, mask)    
 
-        img = self.preprocess(self.mask_values, img, self.scale, is_mask=False)
-        mask = self.preprocess(self.mask_values, mask, self.scale, is_mask=True)
+        img = self.preprocess(img, self.scale, is_mask=False)
+        mask = self.preprocess(mask, self.scale, is_mask=True)
+
 
         return {
             'image': torch.as_tensor(img.copy()).float().contiguous(),
