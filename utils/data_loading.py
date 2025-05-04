@@ -18,7 +18,7 @@ from scipy.ndimage import gaussian_filter, map_coordinates
 import cv2
 
 import cv2
-import numpy as np
+
 
 def apply_clahe(image_np):
     """
@@ -153,12 +153,13 @@ class BasicDataset(Dataset):
         assert newW > 0 and newH > 0, 'Scale is too small, resized images would have no pixel'
         pil_img = pil_img.resize((newW, newH), resample=Image.NEAREST if is_mask else Image.BICUBIC)
         img = np.asarray(pil_img)
-        img = apply_clahe(img)
+        if not is_mask:
+            img = apply_clahe(img)
 
         if is_mask:
             if img.ndim == 3:
                 img = img[..., 0]  # Take first channel if accidentally RGB
-            mask = (img > 0).astype(np.float32)  # Binarize
+            mask = (img == 255).astype(np.float32)
             mask = mask[np.newaxis, ...]  # Shape: (1, H, W)
             return mask
 
@@ -179,7 +180,7 @@ class BasicDataset(Dataset):
                 std = brain_values.std()
                 if std == 0: std = 1.0
                 img = (img - mean) / std
-
+                img = np.clip(img, -3.0, 3.0)
             else:
                 raise ValueError("Expected grayscale image (2D), got color image.")
 
@@ -207,7 +208,7 @@ class BasicDataset(Dataset):
 
         return {
             'image': torch.as_tensor(img.copy()).float().contiguous(),
-            'mask': torch.as_tensor(mask.copy()).long().contiguous()
+            'mask': torch.as_tensor(mask.copy()).float().contiguous()
         }
 
 

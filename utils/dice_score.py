@@ -3,11 +3,18 @@ from torch import Tensor
 
 
 def dice_coeff(input: Tensor, target: Tensor, reduce_batch_first: bool = False, epsilon: float = 1e-6):
-    # Average of Dice coefficient for all batches, or for a single mask
-    assert input.size() == target.size()
-    assert input.dim() == 3 or not reduce_batch_first
+    # Ensure shapes match
+    assert input.size() == target.size(), f"Shape mismatch: input {input.shape}, target {target.shape}"
 
-    sum_dim = (-1, -2) if input.dim() == 2 or not reduce_batch_first else (-1, -2, -3)
+    # Support [B, C, H, W] or [B, H, W]
+    if input.dim() == 4:
+        sum_dim = (-1, -2)  # sum over H and W
+    elif input.dim() == 3:
+        sum_dim = (-1, -2)
+    elif input.dim() == 2:
+        sum_dim = (-1,)
+    else:
+        raise ValueError(f"Unsupported input dimension {input.dim()}")
 
     inter = 2 * (input * target).sum(dim=sum_dim)
     sets_sum = input.sum(dim=sum_dim) + target.sum(dim=sum_dim)
@@ -18,11 +25,11 @@ def dice_coeff(input: Tensor, target: Tensor, reduce_batch_first: bool = False, 
 
 
 def multiclass_dice_coeff(input: Tensor, target: Tensor, reduce_batch_first: bool = False, epsilon: float = 1e-6):
-    # Average of Dice coefficient for all classes
+    # Flatten channel into batch dimension if multiclass
     return dice_coeff(input.flatten(0, 1), target.flatten(0, 1), reduce_batch_first, epsilon)
 
 
 def dice_loss(input: Tensor, target: Tensor, multiclass: bool = False):
-    # Dice loss (objective to minimize) between 0 and 1
+    # Main Dice loss wrapper
     fn = multiclass_dice_coeff if multiclass else dice_coeff
     return 1 - fn(input, target, reduce_batch_first=True)

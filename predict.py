@@ -8,9 +8,9 @@ from unet.hybrid_unet_model import HybridUNet
 from pathlib import Path
 
 # 🛠 Setup paths
-input_folder = Path('data/imgs_filtered/')
-mask_folder = Path('data/masks_binary/')  # fixed masks
-checkpoint_path = Path('checkpoints/checkpoint_epoch1.pth')
+input_folder = Path('data/imgs/')
+mask_folder = Path('data/masks_binary/')  
+checkpoint_path = Path('checkpoints/checkpoint_epoch9.pth')
 save_folder = Path('predictions/')
 save_folder.mkdir(parents=True, exist_ok=True)
 

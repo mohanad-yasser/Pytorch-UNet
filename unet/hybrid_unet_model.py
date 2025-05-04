@@ -109,9 +109,9 @@ class HybridUNet(nn.Module):
         self.down1 = Down(64, 128)
         self.down2 = Down(128, 256)
         self.down3 = Down(256, 512)
-        
+
         factor = 2 if bilinear else 1
-        # Bottleneck with Dilated Convs
+
         self.bottleneck = nn.Sequential(
             nn.Conv2d(512, 1024 // factor, kernel_size=3, padding=2, dilation=2),
             nn.BatchNorm2d(1024 // factor),
@@ -122,12 +122,21 @@ class HybridUNet(nn.Module):
         )
 
         # CBAM Attention after bottleneck
-        self.cbam = CBAM(1024 // factor)
+        self.cbam_bottleneck = CBAM(1024 // factor)
 
+        # Decoder (Upsampling) with CBAM after each up block
         self.up1 = Up(1024, 512 // factor, bilinear)
+        self.cbam1 = CBAM(512 // factor)
+
         self.up2 = Up(512, 256 // factor, bilinear)
+        self.cbam2 = CBAM(256 // factor)
+
         self.up3 = Up(256, 128 // factor, bilinear)
+        self.cbam3 = CBAM(128 // factor)
+
         self.up4 = Up(128, 64, bilinear)
+        self.cbam4 = CBAM(64)
+
         self.outc = OutConv(64, n_classes)
 
     def forward(self, x):
@@ -136,10 +145,19 @@ class HybridUNet(nn.Module):
         x3 = self.down2(x2)
         x4 = self.down3(x3)
         x5 = self.bottleneck(x4)
-        x5 = self.cbam(x5)
+        x5 = self.cbam_bottleneck(x5)
+
         x = self.up1(x5, x4)
+        x = self.cbam1(x)
+
         x = self.up2(x, x3)
+        x = self.cbam2(x)
+
         x = self.up3(x, x2)
+        x = self.cbam3(x)
+
         x = self.up4(x, x1)
+        x = self.cbam4(x)
+
         logits = self.outc(x)
         return logits

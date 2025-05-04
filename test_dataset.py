@@ -1,46 +1,59 @@
+import torch
+import numpy as np
 import matplotlib.pyplot as plt
 from PIL import Image
-import numpy as np
-from utils.data_loading import apply_bias_correction, apply_clahe
+from torch.nn import BCEWithLogitsLoss
+from utils.dice_score import dice_loss
+from utils.data_loading import BasicDataset
 
-# ✅ Load and resize MRI image
-img_path = 'data/imgs/volume_1_slice_46.png'
-image = Image.open(img_path).convert('L').resize((256, 256))
-img_np = np.asarray(image).astype(np.float32)
+# Load raw image and mask manually
+img_path = './data/imgs/volume_1_slice_47.png'
+mask_path = './data/masks_binary/volume_1_slice_47_mask.png'
 
-# ✅ Apply CLAHE → Bias Correction
-img_clahe = apply_clahe(img_np)
-img_bias = apply_bias_correction(img_clahe)
+# Load raw files as grayscale PIL images
+raw_img = Image.open(img_path).convert('L')
+raw_mask = Image.open(mask_path).convert('L')
 
-# ✅ Regular Z-score (all pixels)
-img_all = img_bias.copy()
-img_all = img_all[np.newaxis, ...]
-mean_all = img_all.mean()
-std_all = img_all.std()
-img_z_all = (img_all - mean_all) / (std_all if std_all != 0 else 1.0)
+# Initialize dataset to access preprocessing
+dataset = BasicDataset('./data/imgs/', './data/masks_binary/', scale=1.0)
 
-# ✅ Brain-only Z-score (exclude zeros)
-img_brain = img_bias.copy()
-img_brain = img_brain[np.newaxis, ...]
-brain_mask = img_brain > 0
-mean_brain = img_brain[brain_mask].mean()
-std_brain = img_brain[brain_mask].std()
-img_z_brain = (img_brain - mean_brain) / (std_brain if std_brain != 0 else 1.0)
+# ✅ Preprocess and convert to torch tensors
+# Just ONE unsqueeze for batch dimension (1, 1, H, W)
+image_tensor = torch.tensor(dataset.preprocess(raw_img, scale=1.0, is_mask=False)).unsqueeze(0)  # (1, 1, H, W)
+mask_tensor = torch.tensor(dataset.preprocess(raw_mask, scale=1.0, is_mask=True)).unsqueeze(0)   # (1, 1, H, W)
 
-# ✅ Plot all
-plt.figure(figsize=(12, 3))
 
-plt.subplot(1, 3, 1)
-plt.imshow(img_np, cmap='gray')
-plt.title("Original")
+# ✅ Simulate model output (fuzzy logits around ground truth)
+pred_logits = model(image_tensor)  # Ensure model is loaded and in eval() mode
 
-plt.subplot(1, 3, 2)
-plt.imshow(img_z_all.squeeze(0), cmap='gray')
-plt.title("Regular Z-Score")
 
-plt.subplot(1, 3, 3)
-plt.imshow(img_z_brain.squeeze(0), cmap='gray')
-plt.title("Brain-Only Z-Score")
+# ✅ Compute losses
+bce_fn = BCEWithLogitsLoss()
+bce = bce_fn(pred_logits, mask_tensor)
+dice = dice_loss(torch.sigmoid(pred_logits), mask_tensor, multiclass=False)
+combo = 0.7 * bce + 0.3 * dice
 
+# ✅ Display metrics
+print(f"📊 Combo Loss: {combo.item()}")
+print(f"✅ BCE Loss: {bce.item()}")
+print(f"✅ Dice Loss: {dice.item()}")
+print(f"Mask unique values: {mask_tensor.unique()}")
+print(f"Mask shape: {mask_tensor.shape}")
+
+# ✅ Convert predictions to binary mask for visualization
+with torch.no_grad():
+    pred_probs = torch.sigmoid(pred_logits)
+    pred_binary = (pred_probs > 0.5).float()
+
+# ✅ Plot results
+fig, axes = plt.subplots(1, 2, figsize=(8, 4))
+axes[0].imshow(mask_tensor.squeeze().cpu().numpy(), cmap='gray')
+axes[0].set_title("Ground Truth Mask")
+
+axes[1].imshow(pred_binary.squeeze().cpu().numpy(), cmap='gray')
+axes[1].set_title("Predicted Binary Mask")
+
+for ax in axes:
+    ax.axis('off')
 plt.tight_layout()
 plt.show()

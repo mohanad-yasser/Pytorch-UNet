@@ -1,8 +1,7 @@
+import numpy as np
 import argparse
 import logging
 import os
-import random
-import sys
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -12,12 +11,15 @@ from pathlib import Path
 from torch import optim
 from torch.utils.data import DataLoader, random_split
 from tqdm import tqdm
-
-import wandb
+from utils.balanced_sampler import BalancedMaskSampler
 from evaluate import evaluate
 from unet.hybrid_unet_model import HybridUNet
 from utils.data_loading import BasicDataset, CarvanaDataset
 from utils.dice_score import dice_loss
+from sklearn.model_selection import train_test_split
+from torch.utils.data import Subset
+import matplotlib.pyplot as plt
+
 
 dir_img = Path('./data/imgs/')
 dir_mask = Path('./data/masks_binary/')
@@ -26,55 +28,85 @@ dir_checkpoint = Path('./checkpoints/')
 # 🚀 Hyperparameter Configuration
 config = {
     'epochs': 25,
-    'batch_size': 4,
-    'learning_rate': 1e-5,
+    'batch_size': 1,
+    'learning_rate': 1e-4,
     'val_percent': 0.2,         # 10% validation split
     'img_scale': 1.0,           # full 240x240 images
-    'amp': False,               # no mixed precision yet
+    'amp': True,               # no mixed precision yet
     'bilinear': True,           # use bilinear upsampling
     'n_channels': 1,            # grayscale input (T1 MRI slices)
     'n_classes': 1,             # binary output (tumor or no tumor)
-    'weight_decay': 1e-8,
-    'momentum': 0.999,
+    'weight_decay': 1e-5,
     'gradient_clipping': 1.0,
+    'accumulation_steps': 1
 }
+class ComboLoss(nn.Module):
+    def __init__(self, weight=0.7):
+        super().__init__()
+        self.bce = nn.BCEWithLogitsLoss()
+        self.weight = weight
+
+    def forward(self, preds, targets):
+        bce = self.bce(preds, targets)
+        dice = dice_loss(torch.sigmoid(preds), targets, multiclass=False)
+        return self.weight * bce + (1 - self.weight) * dice
 
 def train_model(
         model,
         device,
         epochs: int = 5,
         batch_size: int = 1,
-        learning_rate: float = 1e-5,
+        learning_rate: float = 1e-4,
         val_percent: float = 0.1,
         save_checkpoint: bool = True,
         img_scale: float = 0.5,
-        amp: bool = False,
-        weight_decay: float = 1e-8,
-        momentum: float = 0.999,
+        amp: bool = True,
+        weight_decay: float = 1e-5,
         gradient_clipping: float = 1.0,
+        accumulation_steps: int = 1
 ):
-    # 1. Create dataset
+     # 1. Create dataset
     try:
         dataset = CarvanaDataset(dir_img, dir_mask, img_scale)
     except (AssertionError, RuntimeError, IndexError):
         dataset = BasicDataset(dir_img, dir_mask, img_scale)
 
-    # 2. Split into train / validation partitions
-    n_val = int(len(dataset) * val_percent)
-    n_train = len(dataset) - n_val
-    train_set, val_set = random_split(dataset, [n_train, n_val], generator=torch.Generator().manual_seed(0))
+    # 2. Balanced Train/Val Split (based on mask content)
+    from sklearn.model_selection import train_test_split
+    from torch.utils.data import Subset
+
+    empty_idxs, non_empty_idxs = [], []
+    print("📦 Classifying masks into empty and non-empty for balanced splitting...")
+    for i in tqdm(range(len(dataset)), desc="🔍 Classifying masks"):
+        mask = dataset[i]['mask'].numpy()
+        if np.max(mask) == 0:
+            empty_idxs.append(i)
+        else:
+            non_empty_idxs.append(i)
+
+    val_percent_float = val_percent  # already float like 0.2
+    train_empty, val_empty = train_test_split(empty_idxs, test_size=val_percent_float, random_state=42)
+    train_non_empty, val_non_empty = train_test_split(non_empty_idxs, test_size=val_percent_float, random_state=42)
+
+    train_indices = train_empty + train_non_empty
+    val_indices = val_empty + val_non_empty
+
+    train_set = Subset(dataset, train_indices)
+    val_set = Subset(dataset, val_indices)
+
+    print(f"\n✅ Final dataset split:")
+    print(f"🔹 Train set — {len(train_set)} samples (empty: {len(train_empty)}, non-empty: {len(train_non_empty)})")
+    print(f"🔸 Val set   — {len(val_set)} samples (empty: {len(val_empty)}, non-empty: {len(val_non_empty)})\n")
 
     # 3. Create data loaders
-    loader_args = dict(batch_size=batch_size, num_workers=os.cpu_count(), pin_memory=True)
-    train_loader = DataLoader(train_set, shuffle=True, **loader_args)
-    val_loader = DataLoader(val_set, shuffle=False, drop_last=True, **loader_args)
+    loader_args = dict(num_workers=os.cpu_count(), pin_memory=True)
+    sampler = BalancedMaskSampler(train_set, empty_fraction=0.4)
+    train_loader = DataLoader(train_set, sampler=sampler, batch_size=batch_size, **loader_args)
+    val_loader = DataLoader(val_set, shuffle=False, drop_last=True, batch_size=batch_size, **loader_args)
 
-    # (Initialize logging)
-    experiment = wandb.init(project='U-Net', resume='allow', anonymous='must')
-    experiment.config.update(
-        dict(epochs=epochs, batch_size=batch_size, learning_rate=learning_rate,
-             val_percent=val_percent, save_checkpoint=save_checkpoint, img_scale=img_scale, amp=amp)
-    )
+
+    n_train = len(train_set)
+    n_val = len(val_set)
 
     logging.info(f'''Starting training:
         Epochs:          {epochs}
@@ -89,23 +121,26 @@ def train_model(
     ''')
 
     # 4. Set up the optimizer, the loss, the learning rate scheduler and the loss scaling for AMP
-    optimizer = optim.RMSprop(model.parameters(),
-                              lr=learning_rate, weight_decay=weight_decay, momentum=momentum, foreach=True)
+    optimizer = optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'max', patience=5)  # goal: maximize Dice score
     grad_scaler = torch.cuda.amp.GradScaler(enabled=amp)
     # Weighted BCE to handle class imbalance
-    if model.n_classes == 1:
-        pos_weight = torch.tensor([7.0], device=device)  # 5.0 is a good starting point
-        criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
-    else:
-        criterion = nn.CrossEntropyLoss()
 
     global_step = 0
+    optimizer.zero_grad(set_to_none=True)  # ✅ Initialize the gradient
+
+
+    # ✅ Define once before the loop
+    criterion = ComboLoss(weight=0.7)
+
+    logging.info(f'Simulating effective batch size: {batch_size * accumulation_steps} '
+             f'(actual batch size {batch_size}, accumulation steps {accumulation_steps})')
 
     # 5. Begin training
     for epoch in range(1, epochs + 1):
         model.train()
         epoch_loss = 0
+
         with tqdm(total=n_train, desc=f'Epoch {epoch}/{epochs}', unit='img') as pbar:
             for batch in train_loader:
                 images, true_masks = batch['image'], batch['mask']
@@ -113,85 +148,79 @@ def train_model(
                 print("True mask unique values:", true_masks.unique())
 
                 assert images.shape[1] == model.n_channels, \
-                    f'Network has been defined with {model.n_channels} input channels, ' \
-                    f'but loaded images have {images.shape[1]} channels. Please check that ' \
-                    'the images are loaded correctly.'
+                    f'Expected {model.n_channels} input channels, got {images.shape[1]}'
 
                 images = images.to(device=device, dtype=torch.float32, memory_format=torch.channels_last)
-                true_masks = true_masks.to(device=device, dtype=torch.long)
-
-                # ✅ ⬇️ ADD dynamic pos_weight calculation here (before forward pass)
-                batch_size = true_masks.shape[0]
-                total_pixels = torch.numel(true_masks)
-                num_positives = true_masks.sum()
-                num_negatives = total_pixels - num_positives
-
-                if num_positives == 0:
-                    dynamic_pos_weight = torch.tensor(1.0, device=device)
-                else:
-                    dynamic_pos_weight = num_negatives / num_positives
-
-                # 🚨 Clamp pos_weight for safety
-                dynamic_pos_weight = torch.clamp(dynamic_pos_weight, min=1.0, max=20.0)
-
-                
+                true_masks = true_masks.to(device=device, dtype=torch.float32)
 
                 with torch.autocast(device.type if device.type != 'mps' else 'cpu', enabled=amp):
                     masks_pred = model(images)
-                   
-                    # 🛑 DO NOT print raw output before activation unless for serious debugging
-                    pred_probs = torch.sigmoid(masks_pred.squeeze(1))
+                    loss = criterion(masks_pred, true_masks)
+                    with torch.no_grad():
+                        bin_pred = (torch.sigmoid(masks_pred) > 0.5).float()
+                        intersection = (bin_pred * true_masks).sum()
+                        union = bin_pred.sum() + true_masks.sum()
+                        dice = (2 * intersection + 1e-6) / (union + 1e-6)
+                        logging.info(f'📏 Train Dice score: {dice.item():.4f}')
 
-                    # 🎯 Proper losses
-                    if model.n_classes == 1:
-                        loss = F.binary_cross_entropy_with_logits(masks_pred, true_masks.float(), pos_weight=dynamic_pos_weight)
-                        pred_probs = torch.sigmoid(masks_pred)  # <== move this inside
-                        loss += dice_loss(pred_probs.squeeze(1), true_masks.float().squeeze(1), multiclass=False)
-                    else:
-                        loss = criterion(masks_pred, true_masks)
-                        loss += dice_loss(
-                            F.softmax(masks_pred, dim=1).float(),
-                            F.one_hot(true_masks, model.n_classes).permute(0, 3, 1, 2).float(),
-                            multiclass=True
-                        )
+                pred_probs = torch.sigmoid(masks_pred)
+                if global_step % 50 == 0:  # Every 50 steps
+                    bin_mask = (pred_probs > 0.5).float()
+                    ratio = bin_mask.mean().item()
+                    logging.info(f"Predicted mask foreground %: {ratio*100:.2f}%")
 
-                # ✅ Print after exiting autocast
                 print(f"📊 Batch Loss: {loss.item():.6f}")
                 print(f"✅ Prediction sigmoid stats: min={pred_probs.min().item():.6f} max={pred_probs.max().item():.6f}")
-                print(f"🧠 True mask unique values: {true_masks.unique(sorted=True)}")
                 print(f"🖼️ Input image stats: min={images.min().item():.6f}, max={images.max().item():.6f}")
 
-                optimizer.zero_grad(set_to_none=True)
+                # ✅ Accumulate loss and gradients
+                loss = loss / accumulation_steps
                 grad_scaler.scale(loss).backward()
-                grad_scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clipping)
-                grad_scaler.step(optimizer)
-                grad_scaler.update()
+
+                if (global_step + 1) % accumulation_steps == 0:
+                    grad_scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clipping)
+                     # ✅ Log gradient norm here
+                    total_norm = 0
+                    for p in model.parameters():
+                        if p.grad is not None:
+                            param_norm = p.grad.data.norm(2)
+                            total_norm += param_norm.item() ** 2
+                    total_norm = total_norm ** 0.5
+                    logging.info(f"Gradient Norm: {total_norm:.4f}")
+                    grad_scaler.step(optimizer)
+                    grad_scaler.update()
+                    optimizer.zero_grad(set_to_none=True)
+
 
                 pbar.update(images.shape[0])
                 global_step += 1
                 epoch_loss += loss.item()
-                experiment.log({
-                    'train loss': loss.item(),
-                    'step': global_step,
-                    'epoch': epoch
-                })
+
                 pbar.set_postfix(**{'loss (batch)': loss.item()})
+                # ✅ Evaluate after each epoch
+                if global_step % 40 == 0:
+                    val_score = evaluate(model, val_loader, device, amp)
+                    scheduler.step(val_score)
+                    logging.info(f'Validation Dice score: {val_score:.4f}')
+                if device.type == 'cuda':
+                    allocated = torch.cuda.memory_allocated() / 1024 ** 2  # in MB
+                    reserved = torch.cuda.memory_reserved() / 1024 ** 2    # in MB
+                    logging.info(f'📊 GPU Memory — Allocated: {allocated:.2f} MB | Reserved: {reserved:.2f} MB')
+
+        logging.info(f"Epoch {epoch} summary — Loss: {epoch_loss:.4f} | Val Dice: {val_score:.4f} | LR: {optimizer.param_groups[0]['lr']:.2e}")
 
 
+         # ✅ Save checkpoint
         if save_checkpoint:
             Path(dir_checkpoint).mkdir(parents=True, exist_ok=True)
-            state_dict = model.state_dict()
-            #state_dict['mask_values'] = dataset.mask_values
-            torch.save(state_dict, str(dir_checkpoint / 'checkpoint_epoch{}.pth'.format(epoch)))
+            torch.save(model.state_dict(), dir_checkpoint / f'checkpoint_epoch{epoch}.pth')
             logging.info(f'Checkpoint {epoch} saved!')
             
 
 
     
-    # Load the input slice
-    input_path = "data/imgs/volume_1_slice_60.png"
-    mask_path = "data/masks/volume_1_slice_60_mask.png"
+    
 
     # Load images
     input_image = Image.open(input_path).convert('L')
@@ -235,7 +264,7 @@ def get_args():
     parser.add_argument('--scale', '-s', type=float, default=0.5, help='Downscaling factor of the images')
     parser.add_argument('--validation', '-v', dest='val', type=float, default=10.0,
                         help='Percent of the data that is used as validation (0-100)')
-    parser.add_argument('--amp', action='store_true', default=False, help='Use mixed precision')
+    parser.add_argument('--amp', action='store_true', default=True, help='Use mixed precision')
     parser.add_argument('--bilinear', action='store_true', default=False, help='Use bilinear upsampling')
     parser.add_argument('--classes', '-c', type=int, default=2, help='Number of classes')
 
@@ -282,8 +311,8 @@ if __name__ == '__main__':
             val_percent=config['val_percent'],
             amp=config['amp'],
             weight_decay=config['weight_decay'],
-            momentum=config['momentum'],
-            gradient_clipping=config['gradient_clipping']
+            gradient_clipping=config['gradient_clipping'],
+            accumulation_steps=4
         )
 
     except torch.cuda.OutOfMemoryError:
@@ -302,7 +331,7 @@ if __name__ == '__main__':
             val_percent=config['val_percent'],
             amp=config['amp'],
             weight_decay=config['weight_decay'],
-            momentum=config['momentum'],
-            gradient_clipping=config['gradient_clipping']
+            gradient_clipping=config['gradient_clipping'],
+            accumulation_steps=4
 )
 
