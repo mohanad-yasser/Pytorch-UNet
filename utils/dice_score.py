@@ -3,7 +3,6 @@ from torch import Tensor
 
 
 def dice_coeff(input: Tensor, target: Tensor, reduce_batch_first: bool = False, epsilon: float = 1e-6):
-    # Ensure shapes match
     assert input.size() == target.size(), f"Shape mismatch: input {input.shape}, target {target.shape}"
 
     # Support [B, C, H, W] or [B, H, W]
@@ -18,9 +17,12 @@ def dice_coeff(input: Tensor, target: Tensor, reduce_batch_first: bool = False, 
 
     inter = 2 * (input * target).sum(dim=sum_dim)
     sets_sum = input.sum(dim=sum_dim) + target.sum(dim=sum_dim)
-    sets_sum = torch.where(sets_sum == 0, inter, sets_sum)
 
-    dice = (inter + epsilon) / (sets_sum + epsilon)
+    # Skip Dice for empty ground truth masks
+    mask = sets_sum > 0
+    dice = torch.zeros_like(sets_sum)
+    dice[mask] = (inter[mask] + epsilon) / (sets_sum[mask] + epsilon)
+
     return dice.mean()
 
 

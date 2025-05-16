@@ -16,6 +16,7 @@ from torchvision.transforms import functional as TF
 import random
 from scipy.ndimage import gaussian_filter, map_coordinates
 import cv2
+from utils.augmentations import JointTransform
 
 import cv2
 
@@ -71,31 +72,38 @@ def joint_augment(image, mask):
     img_np = np.asarray(image).astype(np.float32)
     mask_np = np.asarray(mask).astype(np.uint8)
 
-    # ✅ 50% chance to apply elastic deformation
+    # ✅ Elastic deformation (image + mask)
     if random.random() < 0.5:
         img_np = elastic_deform_2d(img_np, alpha=34, sigma=4)
         mask_np = elastic_deform_2d(mask_np, alpha=34, sigma=4)
-        
         image = Image.fromarray(np.uint8(np.clip(img_np, 0, 255)))
         mask = Image.fromarray(np.uint8(np.clip(mask_np, 0, 255)))
 
-    # 🔁 Optional flips & rotations
+    # ✅ Horizontal flip
     if random.random() > 0.5:
         image = TF.hflip(image)
         mask = TF.hflip(mask)
+
+    # ✅ Vertical flip
     if random.random() > 0.5:
         image = TF.vflip(image)
         mask = TF.vflip(mask)
+
+    # ✅ Rotation
     angle = random.choice([0, 90, 180, 270])
     image = TF.rotate(image, angle)
     mask = TF.rotate(mask, angle)
 
-    # 🌟 Random brightness and contrast (for image only, not mask)
+    # ✅ Contrast adjustment (only on image)
     if random.random() < 0.5:
-        brightness_factor = random.uniform(0.9, 1.1)
         contrast_factor = random.uniform(0.9, 1.1)
-        image = TF.adjust_brightness(image, brightness_factor)
         image = TF.adjust_contrast(image, contrast_factor)
+
+    # ✅ Random Zoom (affine scaling) — 0.9x to 1.1x
+    if random.random() < 0.5:
+        scale_factor = random.uniform(0.9, 1.1)
+        image = TF.affine(image, angle=0, translate=[0, 0], scale=scale_factor, shear=[0.0, 0.0])
+        mask = TF.affine(mask, angle=0, translate=[0, 0], scale=scale_factor, shear=[0.0, 0.0])
 
     return image, mask
 
@@ -124,24 +132,36 @@ def unique_mask_values(idx, mask_dir, mask_suffix):
 
 
 class BasicDataset(Dataset):
-    def __init__(self, images_dir: str, mask_dir: str, scale: float = 1.0, mask_suffix: str = ''):
+    def __init__(self, images_dir: str, mask_dir: str, scale: float = 1.0, transform=None):
         self.images_dir = Path(images_dir)
         self.mask_dir = Path(mask_dir)
         assert 0 < scale <= 1, 'Scale must be between 0 and 1'
         self.scale = scale
-        self.mask_suffix = mask_suffix
+        # Compose both JointTransform and joint_augment
+        self.transform = transform if transform is not None else lambda img, mask: joint_augment(*JointTransform()(img, mask))
 
-        self.ids = [
-            splitext(file)[0]
-            for file in listdir(images_dir)
-            if isfile(join(images_dir, file)) and file.startswith('volume_1_slice')
-        ]
+        # Only include files that start with 'volume_1_'
+        self.ids = []
+        for ext in ['.png', '.jpg', '.tif']:
+            self.ids.extend([file.stem for file in sorted(self.images_dir.glob(f'volume_1_*{ext}'))])
 
-        if not self.ids:
-            raise RuntimeError(f'No input file found in {images_dir}, make sure you put your images there')
-
-        logging.info(f'Creating dataset with {len(self.ids)} examples')
-
+        # Separate into empty and non-empty masks
+        empty_ids = []
+        nonempty_ids = []
+        for idx in self.ids:
+            mask_files = list(self.mask_dir.glob(f'{idx}_mask.*'))
+            if len(mask_files) == 1:
+                mask = Image.open(mask_files[0]).convert('L')
+                if mask.getextrema()[1] == 0:
+                    empty_ids.append(idx)
+                else:
+                    nonempty_ids.append(idx)
+        # 1:1 ratio
+        n_nonempty = len(nonempty_ids)
+        sampled_empty = random.sample(empty_ids, min(n_nonempty, len(empty_ids)))
+        self.ids = nonempty_ids + sampled_empty
+        random.shuffle(self.ids)
+        print(f"Loaded {len(self.ids)} images: {len(nonempty_ids)} non-empty, {len(sampled_empty)} empty (1:1 ratio)")
 
     def __len__(self):
         return len(self.ids)
@@ -152,60 +172,47 @@ class BasicDataset(Dataset):
         newW, newH = int(scale * w), int(scale * h)
         assert newW > 0 and newH > 0, 'Scale is too small, resized images would have no pixel'
         pil_img = pil_img.resize((newW, newH), resample=Image.NEAREST if is_mask else Image.BICUBIC)
-        img = np.asarray(pil_img)
+        img_ndarray = np.asarray(pil_img)
+
         if not is_mask:
-            img = apply_clahe(img)
-
-        if is_mask:
-            if img.ndim == 3:
-                img = img[..., 0]  # Take first channel if accidentally RGB
-            mask = (img == 255).astype(np.float32)
-            mask = mask[np.newaxis, ...]  # Shape: (1, H, W)
-            return mask
-
-
-        else:
-            if img.ndim == 2:
-                # ✅ Step 1: Apply bias correction BEFORE Z-score
-                img = apply_bias_correction(img)
-
-                # ✅ Step 2: Convert to shape (1, H, W)
-                img = img[np.newaxis, ...]
-
-                # ✅ Step 3: Apply Brain-Only Z-score normalization
-                brain_mask = img > 0
-                brain_values = img[brain_mask]
-
-                mean = brain_values.mean()
-                std = brain_values.std()
-                if std == 0: std = 1.0
-                img = (img - mean) / std
-                img = np.clip(img, -3.0, 3.0)
+            if img_ndarray.ndim == 2:
+                img_ndarray = img_ndarray[np.newaxis, ...]
             else:
-                raise ValueError("Expected grayscale image (2D), got color image.")
+                img_ndarray = img_ndarray.transpose((2, 0, 1))
 
-            return img
+            img_ndarray = img_ndarray / 255
 
+        return img_ndarray
 
     def __getitem__(self, idx):
         name = self.ids[idx]
-        mask_file = list(self.mask_dir.glob(name + '_mask.*'))
-        img_file = list(self.images_dir.glob(name + '.*'))
+        mask_file = list(self.mask_dir.glob(f'{name}_mask.*'))[0]
+        img_file = list(self.images_dir.glob(f'{name}.*'))[0]
 
-        assert len(img_file) == 1, f'Either no image or multiple images found for the ID {name}: {img_file}'
-        assert len(mask_file) == 1, f'Either no mask or multiple masks found for the ID {name}: {mask_file}'
-        mask = load_image(mask_file[0])
-        img = load_image(img_file[0])
+        mask = Image.open(mask_file).convert('L')
+        img = Image.open(img_file).convert('L')
 
         assert img.size == mask.size, \
             f'Image and mask {name} should be the same size, but are {img.size} and {mask.size}'
-        
-        img, mask = joint_augment(img, mask)    
 
         img = self.preprocess(img, self.scale, is_mask=False)
         mask = self.preprocess(mask, self.scale, is_mask=True)
 
-
+        # Always apply transform
+        if img.shape[0] == 1:
+            img = img.squeeze(0)
+        img = Image.fromarray((img * 255).astype(np.uint8))
+        mask = Image.fromarray(mask.astype(np.uint8))
+        img, mask = self.transform(img, mask)
+        img = np.array(img) / 255.0
+        mask = np.array(mask)
+        if img.ndim == 3 and img.shape[2] == 3:
+            img = np.array(Image.fromarray((img * 255).astype(np.uint8)).convert('L')) / 255.0
+        if img.ndim == 2:
+            img = img[np.newaxis, ...]
+        if mask.ndim == 2:
+            mask = mask[np.newaxis, ...]
+        mask = (mask > 0).astype(np.float32)
         return {
             'image': torch.as_tensor(img.copy()).float().contiguous(),
             'mask': torch.as_tensor(mask.copy()).float().contiguous()
@@ -213,5 +220,6 @@ class BasicDataset(Dataset):
 
 
 class CarvanaDataset(BasicDataset):
-    def __init__(self, images_dir, mask_dir, scale=1):
-        super().__init__(images_dir, mask_dir, scale, mask_suffix='_mask')
+    def __init__(self, images_dir, mask_dir, scale=1.0, transform=None):
+        super().__init__(images_dir, mask_dir, scale, transform)
+        self.mask_suffix = '_mask'

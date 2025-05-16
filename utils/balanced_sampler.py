@@ -3,7 +3,7 @@ import numpy as np
 from tqdm import tqdm
 
 class BalancedMaskSampler(Sampler):
-    def __init__(self, dataset, empty_fraction=0.4):
+    def __init__(self, dataset, empty_fraction=0.2):
         self.empty_fraction = empty_fraction
         self.dataset = dataset
         self.empty_idxs = []
@@ -40,10 +40,12 @@ class BalancedMaskSampler(Sampler):
             self.empty_idxs,
             size=int(len(self.empty_idxs) * self.empty_fraction),
             replace=False
-        )
+        ).astype(np.int32)  # Ensures integer indices
+
         combined = np.concatenate([self.non_empty_idxs, sampled_empty])
         np.random.shuffle(combined)
         return iter(combined.tolist())
+
 
     def __len__(self):
         return int(len(self.non_empty_idxs) + len(self.empty_idxs) * self.empty_fraction)
