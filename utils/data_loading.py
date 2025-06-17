@@ -20,7 +20,11 @@ def load_image(filename):
     elif ext in ['.pt', '.pth']:
         return Image.fromarray(torch.load(filename).numpy())
     else:
-        return Image.open(filename)
+        img = Image.open(filename)
+        # Convert to grayscale if it's not already
+        if img.mode != 'L':
+            img = img.convert('L')
+        return img
 
 
 def unique_mask_values(idx, mask_dir, mask_suffix):
@@ -43,17 +47,30 @@ class BasicDataset(Dataset):
         self.scale = scale
         self.mask_suffix = mask_suffix
 
-        self.ids = [splitext(file)[0] for file in listdir(images_dir) if isfile(join(images_dir, file)) and not file.startswith('.')]
-        if not self.ids:
-            raise RuntimeError(f'No input file found in {images_dir}, make sure you put your images there')
+        # Use pre-filtered IDs if they exist, otherwise get all files
+        if not hasattr(self, 'ids'):
+            self.ids = [splitext(file)[0] for file in listdir(images_dir) if isfile(join(images_dir, file)) and not file.startswith('.')]
+            if not self.ids:
+                raise RuntimeError(f'No input file found in {images_dir}, make sure you put your images there')
 
         logging.info(f'Creating dataset with {len(self.ids)} examples')
         logging.info('Scanning mask files to determine unique values')
-        with Pool() as p:
-            unique = list(tqdm(
-                p.imap(partial(unique_mask_values, mask_dir=self.mask_dir, mask_suffix=self.mask_suffix), self.ids),
-                total=len(self.ids)
-            ))
+        
+        try:
+            with Pool() as p:
+                unique = list(tqdm(
+                    p.imap(partial(unique_mask_values, mask_dir=self.mask_dir, mask_suffix=self.mask_suffix), self.ids),
+                    total=len(self.ids)
+                ))
+        except Exception as e:
+            logging.warning(f'Multiprocessing failed, using single-threaded processing: {e}')
+            unique = []
+            for idx in tqdm(self.ids, desc='Scanning mask files'):
+                try:
+                    unique.append(unique_mask_values(idx, self.mask_dir, self.mask_suffix))
+                except Exception as e:
+                    logging.warning(f'Failed to process {idx}: {e}')
+                    unique.append([0])  # Default value
 
         self.mask_values = list(sorted(np.unique(np.concatenate(unique), axis=0).tolist()))
         logging.info(f'Unique mask values: {self.mask_values}')
@@ -80,10 +97,16 @@ class BasicDataset(Dataset):
             return mask
 
         else:
+            # Ensure image is 2D (grayscale)
+            if img.ndim == 3 and img.shape[2] == 1:
+                img = img.squeeze(2)  # Remove single channel dimension
+            elif img.ndim == 3 and img.shape[2] > 1:
+                # If it's RGB, convert to grayscale by taking mean
+                img = img.mean(axis=2).astype(img.dtype)
+            
+            # Add channel dimension for single-channel image
             if img.ndim == 2:
                 img = img[np.newaxis, ...]
-            else:
-                img = img.transpose((2, 0, 1))
 
             if (img > 1).any():
                 img = img / 255.0
