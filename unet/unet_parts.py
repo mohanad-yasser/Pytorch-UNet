@@ -5,28 +5,57 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+class ResidualBlock(nn.Module):
+    """Residual block with two convolutions and a skip connection"""
+    
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(out_channels)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(out_channels)
+        self.relu = nn.ReLU(inplace=True)
+        
+        # Skip connection: if input and output channels are different, use 1x1 conv
+        self.skip = nn.Sequential()
+        if in_channels != out_channels:
+            self.skip = nn.Sequential(
+                nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False),
+                nn.BatchNorm2d(out_channels)
+            )
+
+    def forward(self, x):
+        residual = self.skip(x)
+        
+        out = self.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        
+        out += residual
+        out = self.relu(out)
+        
+        return out
+
+
 class DoubleConv(nn.Module):
-    """(convolution => [BN] => ReLU) * 2"""
+    """(convolution => [BN] => ReLU) * 2 with residual connection"""
 
     def __init__(self, in_channels, out_channels, mid_channels=None):
         super().__init__()
         if not mid_channels:
             mid_channels = out_channels
-        self.double_conv = nn.Sequential(
-            nn.Conv2d(in_channels, mid_channels, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(mid_channels),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(mid_channels, out_channels, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=True)
-        )
+        
+        # Use residual blocks instead of simple double conv
+        self.residual_block1 = ResidualBlock(in_channels, mid_channels)
+        self.residual_block2 = ResidualBlock(mid_channels, out_channels)
 
     def forward(self, x):
-        return self.double_conv(x)
+        x = self.residual_block1(x)
+        x = self.residual_block2(x)
+        return x
 
 
 class Down(nn.Module):
-    """Downscaling with maxpool then double conv"""
+    """Downscaling with maxpool then double conv with residual"""
 
     def __init__(self, in_channels, out_channels):
         super().__init__()
@@ -40,7 +69,7 @@ class Down(nn.Module):
 
 
 class Up(nn.Module):
-    """Upscaling then double conv"""
+    """Upscaling then double conv with residual"""
 
     def __init__(self, in_channels, out_channels, bilinear=True):
         super().__init__()

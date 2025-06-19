@@ -5,7 +5,7 @@ from pathlib import Path
 from PIL import Image
 import logging
 from torch.utils.data import DataLoader, random_split
-from unet import UNet
+from unet import ResUNet
 from utils.data_loading import BasicDataset
 import torch.nn.functional as F
 
@@ -25,7 +25,7 @@ def predict_and_visualize(checkpoint_path, num_samples=5):
     val_loader = DataLoader(dataset, shuffle=False, drop_last=False, batch_size=1, num_workers=0, pin_memory=True)
     
     # Create model
-    model = UNet(n_channels=1, n_classes=2, bilinear=False)
+    model = ResUNet(n_channels=1, n_classes=2, bilinear=False)
     model = model.to(memory_format=torch.channels_last)
     
     # Load checkpoint
@@ -89,6 +89,6 @@ def predict_and_visualize(checkpoint_path, num_samples=5):
     return sample_count
 
 if __name__ == '__main__':
-    checkpoint_path = './checkpoints/checkpoint_epoch12.pth'
+    checkpoint_path = './checkpoints/checkpoint_epoch15.pth'
     num_shown = predict_and_visualize(checkpoint_path, num_samples=5)
     print(f'✅ Shown {num_shown} prediction images interactively.') 
