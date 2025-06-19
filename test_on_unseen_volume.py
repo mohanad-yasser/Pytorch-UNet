@@ -4,25 +4,36 @@ import matplotlib.pyplot as plt
 from pathlib import Path
 from PIL import Image
 import logging
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader
 from unet import UNet
-from utils.data_loading import BasicDataset
+from utils.volume_dataset import VolumeDataset
 import torch.nn.functional as F
+from evaluate import evaluate
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 
-def predict_and_visualize(checkpoint_path, num_samples=5):
+def test_on_unseen_volume(checkpoint_path, volume_name, num_samples=5):
+    """
+    Test the trained model on an unseen volume
+    """
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     logging.info(f'Using device {device}')
     
-    # Use combined dataset directories
-    dir_img = Path('./data/imgs_val_t1_tumor_only/')
-    dir_mask = Path('./data/masks_val_t1_tumor_only/')
-    dataset = BasicDataset(dir_img, dir_mask, scale=0.5)
+    # Use the unseen volume dataset
+    dir_img = Path(f'./data/imgs_{volume_name}_t1/')
+    dir_mask = Path(f'./data/masks_{volume_name}_t1/')
     
-    # Use all validation data (no random split needed)
-    val_loader = DataLoader(dataset, shuffle=False, drop_last=False, batch_size=1, num_workers=0, pin_memory=True)
+    if not dir_img.exists() or not dir_mask.exists():
+        logging.error(f"Dataset directories not found: {dir_img} or {dir_mask}")
+        logging.info("Please run: python extract_t1_from_h5.py --h5_dir <path> --volume <number>")
+        return
+    
+    # Create dataset for the unseen volume
+    dataset = VolumeDataset(dir_img, dir_mask, volume_name, scale=0.5)
+    
+    # Create data loader
+    test_loader = DataLoader(dataset, shuffle=False, drop_last=False, batch_size=1, num_workers=0, pin_memory=True)
     
     # Create model
     model = UNet(n_channels=1, n_classes=2, bilinear=False)
@@ -36,11 +47,16 @@ def predict_and_visualize(checkpoint_path, num_samples=5):
     model.eval()
     
     logging.info(f'Model loaded from {checkpoint_path}')
+    logging.info(f'Testing on {volume_name} with {len(dataset)} samples')
     
-    # Generate predictions for a few samples
+    # Evaluate the model
+    dice_score = evaluate(model, test_loader, device, amp=False)
+    logging.info(f'Dice Score on {volume_name}: {dice_score:.4f}')
+    
+    # Generate visualizations for a few samples
     sample_count = 0
     with torch.no_grad():
-        for batch in val_loader:
+        for batch in test_loader:
             if sample_count >= num_samples:
                 break
                 
@@ -68,7 +84,7 @@ def predict_and_visualize(checkpoint_path, num_samples=5):
             
             # Original image
             axes[0].imshow(img_np, cmap='gray')
-            axes[0].set_title('Original T1 Image')
+            axes[0].set_title(f'Original T1 Image ({volume_name})')
             axes[0].axis('off')
             
             # True mask
@@ -81,14 +97,19 @@ def predict_and_visualize(checkpoint_path, num_samples=5):
             axes[2].set_title('Predicted Mask')
             axes[2].axis('off')
             
+            plt.suptitle(f'Model Prediction on {volume_name} - Sample {sample_count+1}')
             plt.tight_layout()
             plt.show()
             sample_count += 1
     
-    logging.info(f'Shown {sample_count} prediction visualizations interactively.')
-    return sample_count
+    logging.info(f'Shown {sample_count} prediction visualizations for {volume_name}')
+    return dice_score
 
 if __name__ == '__main__':
-    checkpoint_path = './checkpoints/checkpoint_epoch12.pth'
-    num_shown = predict_and_visualize(checkpoint_path, num_samples=5)
-    print(f'✅ Shown {num_shown} prediction images interactively.') 
+    # Test on volume 2 (unseen data)
+    checkpoint_path = './checkpoints/checkpoint_epoch10.pth'  # Use the best checkpoint
+    volume_name = 'volume_2'
+    
+    dice_score = test_on_unseen_volume(checkpoint_path, volume_name, num_samples=5)
+    print(f'✅ Tested model on {volume_name}')
+    print(f'📊 Dice Score: {dice_score:.4f}') 
