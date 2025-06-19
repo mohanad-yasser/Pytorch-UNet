@@ -89,6 +89,10 @@ def predict_and_visualize(checkpoint_path, num_samples=5):
     return sample_count
 
 if __name__ == '__main__':
-    checkpoint_path = './checkpoints/checkpoint_epoch14.pth'  # Best checkpoint with augmentations (Dice: 0.631, HD95: 14.86)
+    # Use the best checkpoint from epoch 11 (Dice: 0.628, HD95: 15.28)
+    # This is the best performing model from the 20-epoch training with augmentations
+    checkpoint_path = './checkpoints/checkpoint_epoch11.pth'
     num_shown = predict_and_visualize(checkpoint_path, num_samples=5)
-    print(f'✅ Shown {num_shown} prediction images interactively.') 
+    print(f'✅ Shown {num_shown} prediction images using best model (Epoch 11 - Dice: 0.628, HD95: 15.28)')
+    print(f'📊 Model trained with conservative augmentations for 20 epochs')
+    print(f'⚠️  Note: Performance decreased compared to no-augmentation version (0.726 Dice)') 

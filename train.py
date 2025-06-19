@@ -45,26 +45,25 @@ def train_model(
         gradient_clipping: float = 1.0,
 ):
     # 1. Create datasets (no random split)
-    # Comment out augmentations for baseline training with CBRDilatedUNet
-    # train_transform = A.Compose([
-    #     # Very conservative augmentations for medical images
-    #     A.RandomRotate90(p=0.3),  # Reduced probability
-    #     A.HorizontalFlip(p=0.3),  # Reduced probability, remove vertical flip
-    #     A.Affine(
-    #         translate_percent=0.05,  # Much smaller translation
-    #         scale=(0.95, 1.05),     # Much smaller scale
-    #         rotate=(-5, 5),         # Much smaller rotation
-    #         p=0.3                   # Reduced probability
-    #     ),
-    #     # Remove elastic transform - too aggressive for medical images
-    #     # Remove vertical flip - not anatomically realistic
-    #     A.RandomBrightnessContrast(
-    #         brightness_limit=0.1,   # Much smaller brightness change
-    #         contrast_limit=0.1,     # Much smaller contrast change
-    #         p=0.3                   # Reduced probability
-    #     ),
-    # ])
-    train_transform = None  # Disable augmentations for baseline training
+    # Enable conservative augmentations for medical images
+    train_transform = A.Compose([
+        # Very conservative augmentations for medical images
+        A.RandomRotate90(p=0.3),  # Reduced probability
+        A.HorizontalFlip(p=0.3),  # Reduced probability, remove vertical flip
+        A.Affine(
+            translate_percent=0.05,  # Much smaller translation
+            scale=(0.95, 1.05),     # Much smaller scale
+            rotate=(-5, 5),         # Much smaller rotation
+            p=0.3                   # Reduced probability
+        ),
+        # Remove elastic transform - too aggressive for medical images
+        # Remove vertical flip - not anatomically realistic
+        A.RandomBrightnessContrast(
+            brightness_limit=0.1,   # Much smaller brightness change
+            contrast_limit=0.1,     # Much smaller contrast change
+            p=0.3                   # Reduced probability
+        ),
+    ])
     train_set = BasicDataset(train_img_dir, train_mask_dir, scale=img_scale, transform=train_transform)
     val_set = BasicDataset(val_img_dir, val_mask_dir, scale=img_scale, transform=None)
 
