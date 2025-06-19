@@ -15,7 +15,7 @@ from tqdm import tqdm
 
 import wandb
 from evaluate import evaluate
-from unet import ResUNet
+from unet import CBRDilatedUNet
 from utils.data_loading import BasicDataset, CarvanaDataset
 from utils.volume1_dataset import Volume1Dataset
 from utils.dice_score import dice_loss
@@ -45,24 +45,26 @@ def train_model(
         gradient_clipping: float = 1.0,
 ):
     # 1. Create datasets (no random split)
-    train_transform = A.Compose([
-        # Very conservative augmentations for medical images
-        A.RandomRotate90(p=0.3),  # Reduced probability
-        A.HorizontalFlip(p=0.3),  # Reduced probability, remove vertical flip
-        A.Affine(
-            translate_percent=0.05,  # Much smaller translation
-            scale=(0.95, 1.05),     # Much smaller scale
-            rotate=(-5, 5),         # Much smaller rotation
-            p=0.3                   # Reduced probability
-        ),
-        # Remove elastic transform - too aggressive for medical images
-        # Remove vertical flip - not anatomically realistic
-        A.RandomBrightnessContrast(
-            brightness_limit=0.1,   # Much smaller brightness change
-            contrast_limit=0.1,     # Much smaller contrast change
-            p=0.3                   # Reduced probability
-        ),
-    ])
+    # Comment out augmentations for baseline training with CBRDilatedUNet
+    # train_transform = A.Compose([
+    #     # Very conservative augmentations for medical images
+    #     A.RandomRotate90(p=0.3),  # Reduced probability
+    #     A.HorizontalFlip(p=0.3),  # Reduced probability, remove vertical flip
+    #     A.Affine(
+    #         translate_percent=0.05,  # Much smaller translation
+    #         scale=(0.95, 1.05),     # Much smaller scale
+    #         rotate=(-5, 5),         # Much smaller rotation
+    #         p=0.3                   # Reduced probability
+    #     ),
+    #     # Remove elastic transform - too aggressive for medical images
+    #     # Remove vertical flip - not anatomically realistic
+    #     A.RandomBrightnessContrast(
+    #         brightness_limit=0.1,   # Much smaller brightness change
+    #         contrast_limit=0.1,     # Much smaller contrast change
+    #         p=0.3                   # Reduced probability
+    #     ),
+    # ])
+    train_transform = None  # Disable augmentations for baseline training
     train_set = BasicDataset(train_img_dir, train_mask_dir, scale=img_scale, transform=train_transform)
     val_set = BasicDataset(val_img_dir, val_mask_dir, scale=img_scale, transform=None)
 
@@ -206,13 +208,15 @@ if __name__ == '__main__':
     # Change here to adapt to your data
     # n_channels=1 for grayscale images (T1)
     # n_classes is the number of probabilities you want to get per pixel
-    model = ResUNet(n_channels=1, n_classes=args.classes, bilinear=args.bilinear)
+    model = CBRDilatedUNet(n_channels=1, n_classes=args.classes, bilinear=args.bilinear, use_attention=True)
     model = model.to(memory_format=torch.channels_last)
 
     logging.info(f'Network:\n'
                  f'\t{model.n_channels} input channels\n'
                  f'\t{model.n_classes} output channels (classes)\n'
-                 f'\t{"Bilinear" if model.bilinear else "Transposed conv"} upscaling')
+                 f'\t{"Bilinear" if model.bilinear else "Transposed conv"} upsampling\n'
+                 f'\tCBAM attention: {model.use_attention}\n'
+                 f'\tDilated convolutions: Enabled in bottleneck')
 
     if args.load:
         state_dict = torch.load(args.load, map_location=device)
